@@ -1,0 +1,15 @@
+build/
+dist/
+__pycache__/
+*.bak
+settings.json
+probe_report.json
+autotest_report.json
+selftest.txt
+*.spec
+installer/
+pairing/
+native/rtprecv.dll
+simple.json
+stats/
+edition-direct
