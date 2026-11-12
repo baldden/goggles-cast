@@ -20,7 +20,7 @@ For the stream the main monitor switches to 1920x1080 at the goggles' refresh ra
 4. Start Goggles Cast. The window shows "Goggles connected".
 5. Pick the refresh rate (60 / 100 Hz), then press **Start**. To stop, press **Stop** or **Ctrl+Alt+End** from any program.
 
-The bitrate is set by itself to the most the goggles take over USB: 24 Mbit/s at 60 Hz, 32 Mbit/s at 100 Hz. A log is written to `stats\journal.txt` next to the program.
+The bitrate is set by itself to the most the goggles take over USB: 24 Mbit/s at 60 Hz, 32 Mbit/s at 100 Hz. A log is written to `stats\journal.txt` next to the program. If something does not work, press **Report a problem** in the window, write a line about what you see and press Send: the log goes to the developer (without your Windows user name), no account needed.
 
 ## Building from source
 

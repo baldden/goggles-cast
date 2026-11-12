@@ -13,3 +13,5 @@ native/rtprecv.dll
 simple.json
 stats/
 edition-direct
+report_key.txt
+goggles_cast/_report_key.py

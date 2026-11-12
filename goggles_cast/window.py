@@ -13,7 +13,7 @@ import time
 import tkinter as tk
 from tkinter import font as tkfont
 
-from . import app_dir, display, i18n, usbgoggles
+from . import app_dir, display, i18n, report, usbgoggles
 from .capture import exe_path
 from .i18n import t
 from .stream import Stream
@@ -256,8 +256,11 @@ class Window(tk.Tk):
         self.btn = BigButton(root, self, self._toggle)
         self.btn.grid(row=row, column=0, sticky="ew", pady=(self.px(16), 0))
         self.btn.set(t("Старт", "Start"), "off")
-        tk.Label(root, text=t("Ctrl+Alt+End — стоп из любой программы", "Ctrl+Alt+End stops it from any program"),
-                 bg=BG, fg=DIM, font=(FONT, 9)).grid(row=row + 1, column=0, sticky="w", pady=(self.px(8), 0))
+        foot = tk.Frame(root, bg=BG)
+        foot.grid(row=row + 1, column=0, sticky="ew", pady=(self.px(8), 0))
+        tk.Label(foot, text=t("Ctrl+Alt+End — стоп", "Ctrl+Alt+End stops it"), bg=BG, fg=DIM, font=(FONT, 9)
+                 ).pack(side="left")
+        self._link(foot, t("Сообщить о проблеме", "Report a problem"), self._report, size=9).pack(side="right")
 
     def _bitrate(self) -> int:
         return int(MAX_MBPS.get(int(self.v_hz.get()), MAX_MBPS[60]))
@@ -398,6 +401,58 @@ class Window(tk.Tk):
             time.sleep(2)
 
     # ------------------------------------------------------------------ actions
+    def _report(self) -> None:
+        """A small window: what happens, in the person's words (may stay empty), and Send. The journal goes with it."""
+        if getattr(self, "_report_win", None) is not None and self._report_win.winfo_exists():
+            self._report_win.lift()
+            return
+        win = tk.Toplevel(self, bg=BG, padx=self.px(16), pady=self.px(14))
+        self._report_win = win
+        win.title(t("Сообщить о проблеме", "Report a problem"))
+        win.resizable(False, False)
+        win.transient(self)
+        tk.Label(win, text=t("Что происходит? (можно не писать)", "What happens? (you may leave it empty)"),
+                 bg=BG, fg=TEXT, font=(FONT, 10, "bold"), anchor="w").pack(fill="x")
+        box = tk.Text(win, width=44, height=5, bg=CARD, fg=TEXT, insertbackground=TEXT, relief="flat",
+                      font=(FONT, 10), wrap="word", padx=self.px(8), pady=self.px(6))
+        box.pack(fill="x", pady=(self.px(6), self.px(6)))
+        box.focus_set()
+        tk.Label(win, text=t("Вместе с журналом программы. Имя пользователя Windows из него убирается.",
+                             "The program's journal goes with it, without your Windows user name."),
+                 bg=BG, fg=MUTED, font=(FONT, 9), anchor="w", justify="left",
+                 wraplength=self.px(330)).pack(fill="x")
+        btn = BigButton(win, self, lambda: None)
+        btn.pack(fill="x", pady=(self.px(12), 0))
+        btn.set(t("Отправить", "Send"), "go")
+
+        def send() -> None:
+            note = box.get("1.0", "end").strip()
+            btn.set(t("Отправляю…", "Sending…"), "off")
+            self.log("Report a problem: sending")
+
+            def work() -> None:
+                try:
+                    result = report.send(self.log_path, note)
+                except Exception as e:  # noqa: BLE001
+                    result = f"failed: {e!r}"
+                self.log("Report: " + result)
+                sent = result.startswith("sent")
+
+                def done() -> None:
+                    if win.winfo_exists():
+                        win.destroy()
+                    self._show(t("Отчёт отправлен", "Report sent") if sent else t("Отчёт не отправлен",
+                                                                                   "Report not sent"),
+                               t("Спасибо!", "Thank you!") if sent else
+                               t("Нет связи с GitHub. Отчёт сохранён на рабочем столе.",
+                                 "No connection to GitHub. The report is saved on the Desktop."),
+                               GREEN if sent else AMBER)
+                self.ui(done)
+            threading.Thread(target=work, daemon=True).start()
+        btn.command = send
+        win.update_idletasks()
+        win.geometry(f"+{self.winfo_x() + self.px(20)}+{self.winfo_y() + self.px(60)}")
+
     def _toggle(self) -> None:
         if self.session:
             sess, self.session = self.session, None
@@ -447,11 +502,18 @@ class Window(tk.Tk):
                 where = sess.note or t(f"Монитор ПК на 1920×1080, {sess.hz} Гц до «Стоп».",
                                        f"The PC's monitor at 1920x1080, {sess.hz} Hz until Stop.")
                 state = sess.link.state
-                if sess.capture is not None and not sess.alive() and time.time() - started > 3:
+                if sess.failed:
                     self._show(t("Захват экрана остановился", "The screen capture stopped"),
-                               t("Нажми «Стоп», потом «Старт».", "Press Stop, then Start."), RED)
-                elif state == "ready":
+                               sess.failed + " " + t("Нажми «Сообщить о проблеме».", "Press Report a problem."), RED)
+                elif state == "ready" and sess.sending():
                     self._show(t("Идёт трансляция", "Streaming"), where, GREEN)
+                elif state == "ready" and sess.dropping():
+                    self._show(t("Кадры слишком большие для очков", "Frames too big for the goggles"),
+                               t("Снижаю битрейт…", "Lowering the bitrate…"), AMBER)
+                elif state == "ready":
+                    self._show(t("Очки готовы, жду кадры", "Goggles ready, waiting for frames"),
+                               t("Если так дольше 10 секунд, нажми «Сообщить о проблеме».",
+                                 "If this lasts over 10 seconds, press Report a problem."), AMBER)
                 elif state == "need_vf":
                     self._show(t("Открой Virtual Flight на очках", "Open Virtual Flight on the goggles"),
                                "More → DJI Virtual Flight", AMBER)

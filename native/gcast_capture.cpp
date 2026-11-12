@@ -26,6 +26,7 @@
 #include <io.h>
 #include <fcntl.h>
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -91,6 +92,7 @@ static Args parse(int argc, wchar_t **argv) {
     else if (k == L"--cursor") a.cursor = v != L"0";
     else if (k == L"--min-fps") a.min_fps = _wtof(v.c_str());
     else if (k == L"--shaders") a.shaders = v;
+
   }
   return a;
 }
@@ -327,13 +329,16 @@ int wmain(int argc, wchar_t **argv) {
   if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void **) factory.put()))) die("dxgi factory");
   Com<IDXGIAdapter1> adapter;
   Com<IDXGIOutput> output;
+  // No --display: the main monitor (the one Goggles Cast switches to 1920x1080), which Windows puts at 0,0. 1.0.0 took
+  // the first output of the first adapter, which is not always it with two monitors or two graphics cards.
   for (UINT ai = 0; !output && factory->EnumAdapters1(ai, adapter.put()) != DXGI_ERROR_NOT_FOUND; ++ai) {
     Com<IDXGIOutput> o;
     for (UINT oi = 0; adapter->EnumOutputs(oi, o.put()) != DXGI_ERROR_NOT_FOUND; ++oi) {
       DXGI_OUTPUT_DESC d;
       o->GetDesc(&d);
       if (!d.AttachedToDesktop) continue;
-      if (a.display.empty() || a.display == d.DeviceName) {
+      const bool main_monitor = d.DesktopCoordinates.left == 0 && d.DesktopCoordinates.top == 0;
+      if (a.display.empty() ? main_monitor : a.display == d.DeviceName) {
         output.p = o.p; o.p = nullptr;
         fwprintf(stderr, L"display %ls %ldx%ld\n", d.DeviceName, d.DesktopCoordinates.right - d.DesktopCoordinates.left,
                  d.DesktopCoordinates.bottom - d.DesktopCoordinates.top);
@@ -343,6 +348,9 @@ int wmain(int argc, wchar_t **argv) {
     if (!output) adapter.reset();
   }
   if (!output) die("display not found");
+  DXGI_ADAPTER_DESC adesc{};
+  adapter->GetDesc(&adesc);
+  fwprintf(stderr, L"adapter %ls (vendor %04x)\n", adesc.Description, adesc.VendorId);
 
   Com<ID3D11Device> dev;
   Com<ID3D11DeviceContext> ctx;
@@ -458,7 +466,12 @@ int wmain(int argc, wchar_t **argv) {
 
   // ---- encoder (libavcodec, the encoder's own D3D11 texture) ----
   std::vector<std::string> order;
-  if (a.encoder == "auto") order = {"h264_nvenc", "h264_amf", "h264_qsv"};
+  if (a.encoder == "auto") {   // the encoder of the card the monitor is on first, then the others
+    order = {"h264_nvenc", "h264_amf", "h264_qsv"};
+    const std::string own = adesc.VendorId == 0x1002 ? "h264_amf" : adesc.VendorId == 0x8086 ? "h264_qsv" : "h264_nvenc";
+    order.erase(std::find(order.begin(), order.end(), own));
+    order.insert(order.begin(), own);
+  }
   else order = {a.encoder == "amf" ? "h264_amf" : a.encoder == "nvenc" ? "h264_nvenc" : a.encoder == "qsv" ? "h264_qsv"
                                                                                        : a.encoder};
   AVBufferRef *hwdev = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_D3D11VA);
@@ -471,6 +484,10 @@ int wmain(int argc, wchar_t **argv) {
   AVCodecContext *enc = nullptr;
   std::string enc_name;
   const int64_t b = (int64_t) (a.bitrate * 1e6);
+  // The frame limit as an encoder setting as well (AMF max_au_size, Quick Sync max_frame_size): at most bitrate / fps,
+  // never over 52 KB (goggles_usb.h MAX_FRAME is 56 KB); NVENC's CBR keeps the VBV of one frame by itself.
+  const int64_t max_frame_bytes = std::min<int64_t>(b / 8 / a.fps, 52000);
+
   // The periodic refresh: Apollo's intra refresh (nvenc/nvenc_base.cpp enableIntraRefresh), not a key frame by the
   // clock. A key frame every a.gop frames (0.8.22-0.8.24) in a VBV of one frame is a key frame of one frame's size: it
   // came out blurred and the next frames sharpened again, the picture pulsed once a second (the user saw it on a still
@@ -478,13 +495,10 @@ int wmain(int argc, wchar_t **argv) {
   // changed by 0.97 at it and 0.88 after, 0.00 between). With intra refresh a band of the picture is coded whole in each
   // frame and the whole picture is new every a.gop frames; a key frame at the start, every few seconds and when the goggles need one. An
   // encoder that does not open with it is opened again with the key frame every a.gop frames.
-  std::vector<std::pair<std::string, bool>> tries;
-  for (auto &name : order) { tries.push_back({name, true}); tries.push_back({name, false}); }
-  for (auto &tr : tries) {
-    const std::string &name = tr.first;
-    const bool refresh = tr.second && a.gop > 0;
+  // open_encoder(): one encoder with its own frames, or nullptr
+  auto open_encoder = [&](const std::string &name, bool refresh) -> AVCodecContext * {
     const AVCodec *codec = avcodec_find_encoder_by_name(name.c_str());
-    if (!codec) continue;
+    if (!codec) return nullptr;
     AVCodecContext *c = avcodec_alloc_context3(codec);
     c->width = a.width; c->height = a.height;
     c->time_base = {1, a.fps}; c->framerate = {a.fps, 1};
@@ -499,29 +513,31 @@ int wmain(int argc, wchar_t **argv) {
     c->slices = 1;
     c->color_range = AVCOL_RANGE_MPEG; c->colorspace = AVCOL_SPC_BT709;
     c->color_primaries = AVCOL_PRI_BT709; c->color_trc = AVCOL_TRC_BT709;
-    // Intel: a QSV device derived from the encoder's D3D11 device, QSV frames on it (Apollo video.cpp quicksync)
-    AVBufferRef *base = hwdev, *qdev = nullptr;
-    if (qsv) {
-      if (av_hwdevice_ctx_create_derived(&qdev, AV_HWDEVICE_TYPE_QSV, hwdev, 0) < 0) {
-        fprintf(stderr, "encoder h264_qsv did not open: no QSV device\n");
-        avcodec_free_context(&c);
-        continue;
+    {
+      // Intel: a QSV device derived from the encoder's D3D11 device, QSV frames on it (Apollo video.cpp quicksync)
+      AVBufferRef *base = hwdev, *qdev = nullptr;
+      if (qsv) {
+        if (av_hwdevice_ctx_create_derived(&qdev, AV_HWDEVICE_TYPE_QSV, hwdev, 0) < 0) {
+          fprintf(stderr, "encoder h264_qsv did not open: no QSV device\n");
+          avcodec_free_context(&c);
+          return nullptr;
+        }
+        base = qdev;
       }
-      base = qdev;
+      AVBufferRef *frames = av_hwframe_ctx_alloc(base);
+      auto *fc = (AVHWFramesContext *) frames->data;
+      fc->format = qsv ? AV_PIX_FMT_QSV : AV_PIX_FMT_D3D11; fc->sw_format = AV_PIX_FMT_NV12;
+      fc->width = a.width; fc->height = a.height;
+      fc->initial_pool_size = 1;                                         // Apollo: a single texture
+      if (!qsv)
+        ((AVD3D11VAFramesContext *) fc->hwctx)->BindFlags = D3D11_BIND_RENDER_TARGET;  // Apollo: the encoder needs it
+      if (av_hwframe_ctx_init(frames) < 0) {
+        fprintf(stderr, "encoder %s did not open: no frames\n", name.c_str());
+        av_buffer_unref(&frames); av_buffer_unref(&qdev); avcodec_free_context(&c); return nullptr;
+      }
+      av_buffer_unref(&qdev);
+      c->hw_frames_ctx = frames;
     }
-    AVBufferRef *frames = av_hwframe_ctx_alloc(base);
-    auto *fc = (AVHWFramesContext *) frames->data;
-    fc->format = qsv ? AV_PIX_FMT_QSV : AV_PIX_FMT_D3D11; fc->sw_format = AV_PIX_FMT_NV12;
-    fc->width = a.width; fc->height = a.height;
-    fc->initial_pool_size = 1;                                         // Apollo: a single texture
-    if (!qsv)
-      ((AVD3D11VAFramesContext *) fc->hwctx)->BindFlags = D3D11_BIND_RENDER_TARGET;  // Apollo: the encoder needs it
-    if (av_hwframe_ctx_init(frames) < 0) {
-      fprintf(stderr, "encoder %s did not open: no frames\n", name.c_str());
-      av_buffer_unref(&frames); av_buffer_unref(&qdev); avcodec_free_context(&c); continue;
-    }
-    av_buffer_unref(&qdev);
-    c->hw_frames_ctx = frames;
     AVDictionary *o = nullptr;
     if (name == "h264_amf") {
       // Apollo video.cpp amdvce H.264 with config.cpp's defaults (usage ultralowlatency, rc vbr_latency,
@@ -541,6 +557,7 @@ int wmain(int argc, wchar_t **argv) {
       if (refresh)   // macroblocks coded whole per frame: the whole 1920x1088 picture (120 x 68) in a.gop frames
         av_dict_set(&o, "intra_refresh_mb", std::to_string((120 * 68 + a.gop - 1) / a.gop).c_str(), 0);
       av_dict_set(&o, "profile", "constrained_baseline", 0);   // what the simulator app sends the goggles
+      av_dict_set(&o, "max_au_size", std::to_string(max_frame_bytes * 8).c_str(), 0);   // in bits
     } else if (qsv) {
       // Apollo video.cpp quicksync H.264 (config.cpp: qsv preset medium)
       av_dict_set(&o, "preset", "medium", 0);
@@ -552,6 +569,7 @@ int wmain(int argc, wchar_t **argv) {
       av_dict_set(&o, "pic_timing_sei", "0", 0);
       av_dict_set(&o, "max_dec_frame_buffering", "1", 0);
       av_dict_set(&o, "profile", "baseline", 0);
+      av_dict_set(&o, "max_frame_size", std::to_string(max_frame_bytes).c_str(), 0);
       if (refresh) {
         av_dict_set(&o, "int_ref_type", "vertical", 0);
         av_dict_set(&o, "int_ref_cycle_size", std::to_string(a.gop).c_str(), 0);
@@ -579,15 +597,22 @@ int wmain(int argc, wchar_t **argv) {
       av_strerror(r, e, sizeof e);
       fprintf(stderr, "encoder %s%s did not open: %s\n", name.c_str(), refresh ? " with intra refresh" : "", e);
       avcodec_free_context(&c);
-      continue;
+      return nullptr;
     }
-    enc = c; enc_name = name;
-    fprintf(stderr, "refresh: %s\n", refresh ? "intra refresh" : "key frame every GOP");
-    break;
+    return c;
+  };
+  bool enc_refresh = false;
+  const bool can_refresh = a.gop > 0;
+  for (auto &name : order) {
+    enc = open_encoder(name, can_refresh);
+    enc_refresh = enc && can_refresh;
+    if (!enc && can_refresh) enc = open_encoder(name, false);   // again with a key frame every GOP
+    if (enc) { enc_name = name; break; }
   }
   if (!enc) die("no encoder opened");
-  fprintf(stderr, "encoder %s %dx%d@%d %.0f Mbit/s, capture %ux%u\n", enc_name.c_str(), a.width, a.height, a.fps,
-          a.bitrate, sw, sh);
+  fprintf(stderr, "refresh: %s\n", enc_refresh ? "intra refresh" : "key frame every GOP");
+  fprintf(stderr, "encoder %s %dx%d@%d %.1f Mbit/s, frames up to %lld bytes, capture %ux%u\n", enc_name.c_str(),
+          a.width, a.height, a.fps, a.bitrate, (long long) max_frame_bytes, sw, sh);
   fflush(stderr);
 
   AVFrame *frame = av_frame_alloc();
@@ -687,7 +712,7 @@ int wmain(int argc, wchar_t **argv) {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     AVPacket *pkt = av_packet_alloc();
     int64_t pts = 0, last_stat = qpc(), frames_out = 0, bytes_out = 0, sum_cap_enc = 0, max_cap_enc = 0;
-    int64_t sum_present_cap = 0, max_present_cap = 0;
+    int64_t sum_present_cap = 0, max_present_cap = 0, max_frame = 0, last_key = 0;
     bool converted = false;
     // Steady output (GogglesCast, not Apollo). Apollo encodes each picture when it comes and Moonlight paces the frames
     // on the client (its Pacer: the newest frame at each display refresh). The goggles have no pacer and the maker's
@@ -749,10 +774,16 @@ int wmain(int argc, wchar_t **argv) {
         ++g_repeats;
         j.t_present = j.t_cap = qpc();
       }
-      if (j.slot >= 0) {
-        converted = true;
-        ring[j.slot].ekm->AcquireSync(1, INFINITE);
-        // BGRA -> NV12 into the encoder's texture (Apollo convert())
+      // A key frame every 3 s as well, as DJI's Virtual Flight app sends these goggles (its I_FRAME_INTERVAL is 3).
+      // 0.8.25 had one at the start and on request only, and the goggles stayed black for the user: the one key frame
+      // sent when the stream starts is lost if the goggles have not switched to the simulator picture yet, and nothing
+      // else ever gave their decoder a place to start (also after the goggles are taken off or leave their menu).
+      // The intra refresh above still keeps the picture from pulsing between them; this one is 1 in 180 frames.
+      static int since_key = 0;
+      const bool periodic = ++since_key >= a.fps * 3;
+      const bool want = g_want_key.exchange(false) || periodic;
+      if (want) since_key = 0;
+      auto convert = [&](ID3D11ShaderResourceView *src) {   // BGRA -> NV12 into the encoder's texture (Apollo convert())
         ID3D11ShaderResourceView *null_srv = nullptr;
         ID3D11RenderTargetView *null_rtv = nullptr;
         ectx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -761,7 +792,7 @@ int wmain(int argc, wchar_t **argv) {
         ectx->VSSetConstantBuffers(0, 1, &cb_subsample.p);
         ectx->VSSetConstantBuffers(1, 1, &cb_rotate_e.p);
         ectx->OMSetBlendState(blend_disable_e, nullptr, 0xFFFFFFFFu);
-        ectx->PSSetShaderResources(0, 1, &ring[j.slot].esrv.p);
+        ectx->PSSetShaderResources(0, 1, &src);
         ectx->OMSetRenderTargets(1, &rtv_y.p, nullptr);
         ectx->VSSetShader(vs_y, nullptr, 0);
         ectx->PSSetShader(ps_y, nullptr, 0);
@@ -775,6 +806,11 @@ int wmain(int argc, wchar_t **argv) {
         ectx->PSSetShaderResources(0, 1, &null_srv);
         ectx->OMSetRenderTargets(1, &null_rtv, nullptr);
         ectx->Flush();   // the conversion goes to the GPU now, not when someone else happens to flush
+      };
+      if (j.slot >= 0) {
+        converted = true;
+        ring[j.slot].ekm->AcquireSync(1, INFINITE);
+        convert(ring[j.slot].esrv);
         ring[j.slot].ekm->ReleaseSync(0);
         ring[j.slot].key = 0;
         enc_slot = -1;
@@ -782,15 +818,6 @@ int wmain(int argc, wchar_t **argv) {
       // outside the context lock: avcodec_send_frame already runs AMF's submit + wait for the output (~5 ms), and the
       // capture thread must be able to take the next picture meanwhile (measured: a whole frame lost otherwise)
       frame->pts = pts++;
-      // A key frame every 3 s as well, as DJI's Virtual Flight app sends these goggles (its I_FRAME_INTERVAL is 3).
-      // 0.8.25 had one at the start and on request only, and the goggles stayed black for the user: the one key frame
-      // sent when the stream starts is lost if the goggles have not switched to the simulator picture yet, and nothing
-      // else ever gave their decoder a place to start (also after the goggles are taken off or leave their menu).
-      // The intra refresh above still keeps the picture from pulsing between them; this one is 1 in 180 frames.
-      static int since_key = 0;
-      const bool periodic = ++since_key >= a.fps * 3;
-      const bool want = g_want_key.exchange(false) || periodic;
-      if (want) since_key = 0;
       frame->pict_type = want ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
       if (avcodec_send_frame(enc, frame) < 0) die("send_frame");
       int64_t t_sent = qpc();
@@ -810,7 +837,8 @@ int wmain(int argc, wchar_t **argv) {
           g_vq.push_back(std::move(vp));
         }
         g_vq_cv.notify_one();
-        ++frames_out; bytes_out += pkt->size;
+        ++frames_out; bytes_out += pkt->size; max_frame = std::max<int64_t>(max_frame, pkt->size);
+        if (pkt->flags & AV_PKT_FLAG_KEY) last_key = pkt->size;
         int64_t ce = t_enc - j.t_cap;
         sum_cap_enc += ce; max_cap_enc = std::max(max_cap_enc, ce);
         sum_present_cap += j.t_cap - j.t_present;
@@ -823,16 +851,17 @@ int wmain(int argc, wchar_t **argv) {
         double dt = double(now - last_stat) / freq;
         fprintf(stderr, "stat fps=%.1f mbps=%.1f cap_enc_ms=%.2f cap_enc_max_ms=%.2f present_cap_ms=%.2f "
                 "present_cap_max_ms=%.2f acc_lost=%lld late=%lld repeats=%lld ptr=%lld queue_drop=%lld "
-                "late_tick=%lld max_queue=%lld presents=%lld usb_sent=%lld usb_oversize=%lld\n",
+                "late_tick=%lld max_queue=%lld presents=%lld usb_sent=%lld usb_oversize=%lld max_frame=%lld key=%lld\n",
                 frames_out / dt, bytes_out * 8 / dt / 1e6, frames_out ? sum_cap_enc * 1000.0 / freq / frames_out : 0.0,
                 max_cap_enc * 1000.0 / freq, frames_out ? sum_present_cap * 1000.0 / freq / frames_out : 0.0,
                 max_present_cap * 1000.0 / freq, (long long) g_acc_lost.exchange(0), (long long) g_late.exchange(0),
                 (long long) g_repeats.exchange(0), (long long) g_ptr.exchange(0), (long long) n_queue_drop.exchange(0),
                 (long long) g_late_tick.exchange(0), (long long) max_queue.exchange(0),
                 (long long) (g_presents.exchange(0) / dt), (long long) g_usb->frames_sent.exchange(0),
-                (long long) g_usb->frames_oversize.exchange(0));
+                (long long) g_usb->frames_oversize.exchange(0), (long long) max_frame,
+                (long long) last_key);
         fflush(stderr);
-        last_stat = now; frames_out = bytes_out = sum_cap_enc = max_cap_enc = sum_present_cap = max_present_cap = 0;
+        last_stat = now; frames_out = bytes_out = sum_cap_enc = max_cap_enc = sum_present_cap = max_present_cap = max_frame = 0;
       }
     }
   }).detach();
@@ -859,7 +888,7 @@ int wmain(int argc, wchar_t **argv) {
     if (hr == DXGI_ERROR_WAIT_TIMEOUT) return 1;
     if (hr == DXGI_ERROR_ACCESS_LOST || hr == DXGI_ERROR_ACCESS_DENIED || hr == (HRESULT) WAIT_ABANDONED) {
       // Apollo display_base.cpp: capture_e::reinit, and video.cpp then makes the display and the encoders anew (after
-      // a mode change the new size needs new textures). Here: exit code 3, the program starts the capture again.
+      // a mode change the new size needs new textures). Here: exit code 3, Goggles Cast starts the capture again.
       fprintf(stderr, "duplication lost (0x%08lx): reinit\n", (unsigned long) hr);
       fflush(stderr);
       ExitProcess(3);

@@ -28,7 +28,8 @@ class Capture:
         self.on_line = on_line or (lambda line: None)
         self.log = log
         self.proc: subprocess.Popen | None = None
-        self.stat: dict[str, str] = {}   # the last "stat" line: fps, mbps, cap_enc_ms, presents, usb_sent, ...
+        self.stat: dict[str, str] = {}   # the last "stat" line: fps, mbps, presents, usb_sent, usb_oversize, max_frame...
+        self.stat_at = 0.0               # when it came
         self.tail: list[str] = []
         self.encoder = ""
 
@@ -53,6 +54,7 @@ class Capture:
             line = raw.decode(errors="replace").strip()
             if line.startswith("stat "):
                 self.stat = dict(kv.partition("=")[::2] for kv in line[5:].split())
+                self.stat_at = time.time()
             elif line:
                 if line.startswith("encoder ") and " did not open" not in line:
                     self.encoder = line.split()[1]

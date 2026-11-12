@@ -71,7 +71,7 @@ def run(hz: int, seconds: float = 6.0) -> None:
         new, fps = float(st.get("presents", 0)), float(st.get("fps", 0))
         check(new >= hz * 0.95, f"new pictures from Windows {new:.0f}/s with a game at {hz}/s")
         check(fps >= hz * 0.95, f"frames encoded {fps:.1f}/s")
-        check(s.alive(), f"capture running, link to the goggles: {s.link.state}")
+        check(s.alive() and s.capture.alive(), f"capture running, link to the goggles: {s.link.state}")
     finally:
         if game and game.poll() is None:
             game.kill()

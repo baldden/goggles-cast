@@ -121,10 +121,17 @@ class Link {
       ++frames_oversize;
       g_want_key = true;   // the frames after it refer to it: start again at a key frame that fits
       resync_ = true;
+      waiting_ = 1;
       return false;
     }
-    if (resync_ && !idr) { g_want_key = true; return false; }
+    if (resync_ && !idr) {
+      // one request, again every 30 frames while none comes: a request per waiting frame (1.0.0) made two or three key
+      // frames in a row, each the biggest and least sharp kind of frame
+      if (waiting_++ % 30 == 0) g_want_key = true;
+      return false;
+    }
     resync_ = false;
+    waiting_ = 0;
     FILETIME ft;
     GetSystemTimePreciseAsFileTime(&ft);
     const int64_t unix_ms = int64_t(((uint64_t) ft.dwHighDateTime << 32 | ft.dwLowDateTime) - 116444736000000000ULL) / 10000;
@@ -164,6 +171,7 @@ class Link {
   std::map<uint16_t, Pending> pending_;
   std::atomic<bool> resync_{true}, write_failed_{false};
   uint32_t chunk_counter_ = 0;            // the video thread only
+  uint32_t waiting_ = 0;                  // the video thread only: frames dropped while waiting for a key frame
   // the reader thread only
   int state_ = 0;                         // 0 heartbeat, 1 identity, 2 simulator mode, 3 ready
   int64_t next_hb_ = 0, last_ack_ = 0;

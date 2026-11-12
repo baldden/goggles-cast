@@ -4,7 +4,20 @@
 param([switch]$Installer, [string]$Version = "1.0.0")
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
-python -m PyInstaller --noconfirm --onedir --windowed --name GogglesCast --distpath dist --workpath build GogglesCast.pyw
+# The problem-report key (report_key.txt next to this script, not in the repository: a GitHub token that can only
+# create issues in baldden/goggles-cast-reports) goes into the build, lightly masked; without it the report button
+# saves the report on the Desktop instead.
+$keyFile = Join-Path $PSScriptRoot 'report_key.txt'
+$keyModule = Join-Path $PSScriptRoot 'goggles_cast\_report_key.py'
+if (Test-Path $keyFile) {
+    $key = (Get-Content $keyFile -Raw).Trim()
+    $masked = ([Text.Encoding]::ASCII.GetBytes($key) | ForEach-Object { $_ -bxor 0x5A }) -join ','
+    Set-Content -Path $keyModule -Value "KEY = bytes([$masked])" -Encoding ascii
+} else { Write-Host 'No report_key.txt: the report button will save reports on the Desktop' }
+try {
+    python -m PyInstaller --noconfirm --onedir --windowed --name GogglesCast --distpath dist --workpath build `
+        --hidden-import goggles_cast._report_key GogglesCast.pyw
+} finally { Remove-Item $keyModule -ErrorAction SilentlyContinue }
 # Apollo's capture + encoder path (native\build.sh, MSYS2)
 if (-not (Test-Path native\dist\gcast_capture.exe)) { & C:\msys64\usr\bin\bash.exe -lc /c/code/goggles-cast/native/build.sh }
 if (-not (Test-Path native\dist\gcast_capture.exe)) { throw 'native\dist\gcast_capture.exe missing: run native/build.sh in MSYS2' }
